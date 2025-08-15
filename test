@@ -1,0 +1,448 @@
+use serde::Deserialize;
+use serde_json::json;
+use std::{collections::HashMap, fs, io::{self, Write}, time::{SystemTime, UNIX_EPOCH, Duration}};
+use base64::{Engine as _, engine::general_purpose};
+use ed25519_dalek::{Signer, SigningKey as Ed25519SigningKey};
+use reqwest::blocking::Client;
+use anyhow::{Result, bail};
+use rand::{Rng, thread_rng};
+
+// New struct for accounts.txt entries
+#[derive(Deserialize)]
+struct Account {
+    priv_key: String,
+    addr: String,
+}
+
+#[derive(Deserialize)]
+struct Wallet {
+    #[serde(rename = "priv")]
+    priv_: String,
+    addr: String,
+    rpc: String,
+}
+
+#[derive(Deserialize)]
+struct Method {
+    name: String,
+    label: String,
+    params: Vec<Param>,
+    #[serde(rename = "type")]
+    method_type: String,
+}
+
+#[derive(Deserialize)]
+struct Param {
+    name: String,
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    param_type: String,
+    example: Option<String>,
+    max: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct Interface {
+    contract: String,
+    methods: Vec<Method>,
+}
+
+#[derive(Deserialize)]
+struct BalanceResponse {
+    balance_raw: String,
+    nonce: u64,
+}
+
+fn api_call<T: for<'de> Deserialize<'de>>(
+    client: &Client,
+    method: &str,
+    url: &str,
+    data: Option<serde_json::Value>
+) -> Result<T> {
+    let response = match method {
+        "GET" => client.get(url).send()?,
+        "POST" => client.post(url).json(&data).send()?,
+        _ => bail!("unsupported method"),
+    };
+    
+    if response.status().as_u16() >= 400 {
+        bail!("api error: {}", response.text()?);
+    }
+    
+    Ok(response.json()?)
+}
+
+fn sign_tx(sk: &Ed25519SigningKey, tx: &HashMap<&str, String>) -> String {
+    let blob = format!(
+        r#"{{"from":"{}","to_":"{}","amount":"{}","nonce":{},"ou":"{}","timestamp":{}}}"#,
+        tx["from"], tx["to_"], tx["amount"], tx["nonce"], tx["ou"], tx["timestamp"]
+    );
+    
+    let signature = sk.sign(blob.as_bytes());
+    general_purpose::STANDARD.encode(signature.to_bytes())
+}
+
+fn get_balance(client: &Client, api_url: &str, addr: &str) -> Result<(f64, u64)> {
+    let balance: BalanceResponse = api_call(
+        client,
+        "GET",
+        &format!("{}/balance/{}", api_url, addr),
+        None
+    )?;
+    
+    Ok((balance.balance_raw.parse::<f64>()? / 1_000_000.0, balance.nonce))
+}
+
+fn view_call(
+    client: &Client,
+    api_url: &str,
+    contract: &str,
+    method: &str,
+    params: &[String],
+    caller: &str
+) -> Result<Option<String>> {
+    let response: serde_json::Value = api_call(
+        client,
+        "POST",
+        &format!("{}/contract/call-view", api_url),
+        Some(json!({
+            "contract": contract,
+            "method": method,
+            "params": params,
+            "caller": caller
+        }))
+    )?;
+    
+    Ok(if response["status"] == "success" {
+        response["result"].as_str().map(|s| s.to_string())
+    } else {
+        None
+    })
+}
+
+fn call_contract(
+    client: &Client,
+    api_url: &str,
+    sk: &Ed25519SigningKey,
+    from_addr: &str,
+    contract: &str,
+    method: &str,
+    params: &[String]
+) -> Result<String> {
+    let (_, nonce) = get_balance(client, api_url, from_addr)?;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
+    
+    let mut tx = HashMap::new();
+    tx.insert("from", from_addr.to_string());
+    tx.insert("to_", contract.to_string());
+    tx.insert("amount", "0".to_string());
+    tx.insert("nonce", (nonce + 1).to_string());
+    tx.insert("ou", "1".to_string());
+    tx.insert("timestamp", timestamp.to_string());
+    
+    let signature = sign_tx(sk, &tx);
+    let public_key = general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+    
+    let response: serde_json::Value = api_call(
+        client,
+        "POST",
+        &format!("{}/call-contract", api_url),
+        Some(json!({
+            "contract": contract,
+            "method": method,
+            "params": params,
+            "caller": from_addr,
+            "nonce": nonce + 1,
+            "timestamp": timestamp,
+            "signature": signature,
+            "public_key": public_key
+        }))
+    )?;
+    
+    Ok(response["tx_hash"].as_str().unwrap_or("").to_string())
+}
+
+fn wait_tx(client: &Client, api_url: &str, tx_hash: &str, timeout: u64) -> Result<bool> {
+    let start = SystemTime::now();
+    
+    loop {
+        let elapsed = SystemTime::now().duration_since(start)?.as_secs();
+        if elapsed > timeout {
+            return Ok(false);
+        }
+        
+        let tx: serde_json::Value = api_call(
+            client,
+            "GET",
+            &format!("{}/tx/{}", api_url, tx_hash),
+            None
+        )?;
+        
+        if tx["status"] == "confirmed" {
+            return Ok(true);
+        }
+        
+        print!(".");
+        io::stdout().flush()?;
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn read_input(prompt: &str) -> String {
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    input.trim().to_string()
+}
+
+fn parse_params(params: &[Param]) -> Vec<String> {
+    params.iter().map(|p| {
+        let mut prompt = format!("{}", p.name);
+        if let Some(example) = &p.example {
+            prompt.push_str(&format!(" (e.g. {})", example));
+        }
+        if let Some(max) = p.max {
+            prompt.push_str(&format!(" (max: {})", max));
+        }
+        prompt.push_str(": ");
+        read_input(&prompt)
+    }).collect()
+}
+
+fn generate_random_params(method: &Method, addr: &str) -> Vec<String> {
+    let mut rng = thread_rng();
+    match method.name.as_str() {
+        "greeting" => vec![],
+        "contract_info" => vec![],
+        "claim" => vec![],
+        "balance_of" => vec![addr.to_string()],
+        "dot_product" => vec![
+            rng.gen_range(1..=100).to_string(),
+            rng.gen_range(1..=100).to_string(),
+            rng.gen_range(1..=100).to_string(),
+            rng.gen_range(1..=100).to_string(),
+        ],
+        "vector_magnitude" => vec![
+            rng.gen_range(1..=100).to_string(),
+            rng.gen_range(1..=100).to_string(),
+        ],
+        "power" => vec![
+            rng.gen_range(1..=10).to_string(),
+            rng.gen_range(0..=5).to_string(),
+        ],
+        "factorial" => vec![rng.gen_range(2..=20).to_string()],
+        "fibonacci" => vec![rng.gen_range(1..=20).to_string()],
+        "gcd" => vec![
+            rng.gen_range(1..=100).to_string(),
+            rng.gen_range(1..=100).to_string(),
+        ],
+        "is_prime" => vec![rng.gen_range(1..=100).to_string()],
+        "determinant" => vec![
+            rng.gen_range(1..=10).to_string(),
+            rng.gen_range(1..=10).to_string(),
+            rng.gen_range(1..=10).to_string(),
+            rng.gen_range(10..=10).to_string(),
+        ],
+        "lerp" => vec![
+            rng.gen_range(1..=100).to_string(),
+            rng.gen_range(1..=100).to_string(),
+            rng.gen_range(0..=100).to_string(),
+        ],
+        "mod_exp" => vec![
+            rng.gen_range(1..=10).to_string(),
+            rng.gen_range(0..=5).to_string(),
+            rng.gen_range(1..=100).to_string(),
+        ],
+        _ => vec![],
+    }
+}
+
+fn has_claimed(client: &Client, api_url: &str, contract: &str, addr: &str) -> Result<bool> {
+    let result = view_call(client, api_url, contract, "balance_of", &[addr.to_string()], addr)?;
+    Ok(result.map(|balance| balance != "0").unwrap_or(false))
+}
+
+fn automate_interactions(
+    client: &Client,
+    interface: &Interface,
+    accounts: &[Account],
+    rpc: &str,
+    method_indices: &[usize],
+) -> Result<()> {
+    let mut rng = thread_rng();
+    
+    for (i, account) in accounts.iter().enumerate() {
+        println!("\nProcessing wallet {} (address: {})", i + 1, account.addr);
+
+        let sk_bytes = match general_purpose::STANDARD.decode(&account.priv_key) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                println!("Error decoding private key for {}: {}", account.addr, e);
+                continue;
+            }
+        };
+
+        let sk_array: [u8; 32] = match sk_bytes.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                println!("Invalid private key length for {}", account.addr);
+                continue;
+            }
+        };
+        let sk = Ed25519SigningKey::from_bytes(&sk_array);
+
+        match get_balance(client, rpc, &account.addr) {
+            Ok((balance, nonce)) => {
+                println!("Balance: {:.6} oct (nonce: {})", balance, nonce);
+            }
+            Err(e) => {
+                println!("Error fetching balance for {}: {}", account.addr, e);
+                continue;
+            }
+        }
+
+        for &idx in method_indices {
+            if idx == 0 || idx > interface.methods.len() {
+                continue;
+            }
+            let method = &interface.methods[idx - 1];
+            println!("\nExecuting method: {} ({})", method.name, method.label);
+
+            if idx == 3 && has_claimed(client, rpc, &interface.contract, &account.addr)? {
+                println!("Skipping claim for {}: already claimed", account.addr);
+                continue;
+            }
+
+            let params = generate_random_params(method, &account.addr);
+            println!("Parameters: {:?}", params);
+
+            match method.method_type.as_str() {
+                "view" => {
+                    match view_call(client, rpc, &interface.contract, &method.name, &params, &account.addr) {
+                        Ok(result) => println!("Result: {:?}", result.unwrap_or_else(|| "none".to_string())),
+                        Err(e) => println!("Error executing view call: {}", e),
+                    }
+                }
+                "call" => {
+                    match call_contract(client, rpc, &sk, &account.addr, &interface.contract, &method.name, &params) {
+                        Ok(tx_hash) => {
+                            println!("Transaction hash: {}", tx_hash);
+                            print!("Waiting for confirmation");
+                            io::stdout().flush()?;
+                            match wait_tx(client, rpc, &tx_hash, 100) {
+                                Ok(true) => println!("\nConfirmed"),
+                                Ok(false) => println!("\nTimeout"),
+                                Err(e) => println!("\nError: {}", e),
+                            }
+                        }
+                        Err(e) => println!("Error executing call: {}", e),
+                    }
+                }
+                _ => println!("Unknown method type"),
+            }
+
+            let delay_secs = rng.gen_range(5..=18);
+            println!("Waiting {} seconds before next interaction...", delay_secs);
+            std::thread::sleep(Duration::from_secs(delay_secs));
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let wallet: Wallet = serde_json::from_str(&fs::read_to_string("wallet.json")?)?;
+    let interface: Interface = serde_json::from_str(&fs::read_to_string("exec_interface.json")?)?;
+
+    let accounts_content = fs::read_to_string("accounts.txt")?;
+    let accounts: Vec<Account> = accounts_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line))
+        .collect::<Result<Vec<Account>, _>>()?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(100))
+        .build()?;
+
+    println!("Select mode: (1) Manual, (2) Automated");
+    let mode = read_input("Choice: ");
+
+    if mode == "2" {
+        let method_indices: Vec<usize> = (1..=14).filter(|&i| i != 3).collect();
+        loop {
+            println!("\nRunning automated interactions...");
+            automate_interactions(&client, &interface, &accounts, &wallet.rpc, &method_indices)?;
+            println!("\nAutomation run complete");
+
+            let rerun_mins = thread_rng().gen_range(5..=30);
+            let rerun_secs = rerun_mins * 60;
+            println!("Waiting {} minutes ({} seconds) before next run...", rerun_mins, rerun_secs);
+            std::thread::sleep(Duration::from_secs(rerun_secs));
+        }
+    } else {
+        let sk_bytes = general_purpose::STANDARD.decode(&wallet.priv_)?;
+        let sk = Ed25519SigningKey::from_bytes(&sk_bytes.try_into().unwrap());
+
+        loop {
+            println!("\n--- ocs01 test client ---");
+            println!("contract: {}", interface.contract);
+            
+            let (balance, nonce) = get_balance(&client, &wallet.rpc, &wallet.addr)?;
+            println!("your balance: {:.6} oct (nonce: {})", balance, nonce);
+            println!("\nselect method:");
+            
+            for (i, method) in interface.methods.iter().enumerate() {
+                println!("{}. {}", i + 1, method.label);
+            }
+            println!("0. exit");
+            
+            let choice = read_input("\nchoice: ");
+            if choice == "0" {
+                break;
+            }
+            
+            if let Ok(idx) = choice.parse::<usize>() {
+                if idx > 0 && idx <= interface.methods.len() {
+                    let method = &interface.methods[idx - 1];
+                    println!("\n--- {} ---", method.name);
+                    
+                    let params = parse_params(&method.params);
+                    
+                    match method.method_type.as_str() {
+                        "view" => {
+                            match view_call(&client, &wallet.rpc, &interface.contract, &method.name, &params, &wallet.addr) {
+                                Ok(result) => println!("\nresult: {:?}", result.unwrap_or_else(|| "none".to_string())),
+                                Err(e) => println!("error: {}", e),
+                            }
+                        }
+                        "call" => {
+                            match call_contract(&client, &wallet.rpc, &sk, &wallet.addr, &interface.contract, &method.name, &params) {
+                                Ok(tx_hash) => {
+                                    println!("\ntx: {}", tx_hash);
+                                    if read_input("wait for confirmation? y/n: ").to_lowercase() == "y" {
+                                        print!("waiting");
+                                        io::stdout().flush()?;
+                                        match wait_tx(&client, &wallet.rpc, &tx_hash, 100) {
+                                            Ok(true) => println!("\nconfirmed"),
+                                            Ok(false) => println!("\ntimeout"),
+                                            Err(e) => println!("\nerror: {}", e),
+                                        }
+                                    }
+                                }
+                                Err(e) => println!("error: {}", e),
+                            }
+                        }
+                        _ => println!("unknown method type"),
+                    }
+                }
+            }
+            
+            read_input("\npress enter to continue...");
+        }
+    }
+
+    println!("\nbye");
+    Ok(())
+}
